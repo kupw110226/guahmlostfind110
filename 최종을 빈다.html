@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>분실물 게시판 (GitHub Issues 백엔드)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; margin:20px; font-size:16px; }
+    #top-bar { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    #left-menu { display:flex; align-items:center; gap:10px; }
+    #left-menu img { height:40px; }
+    #left-menu button, #admin-btn { padding:5px 10px; }
+    #admin-controls { display:flex; gap:5px; align-items:center; }
+    #content > div { display:none; margin-top:20px; }
+    .item { border:1px solid #ccc; padding:10px; margin-bottom:10px; position:relative; cursor:pointer; display:flex; gap:10px; align-items:center; }
+    .item img { max-width:100px; max-height:80px; object-fit:cover; border-radius:6px; }
+    .delete-btn { position:absolute; top:5px; right:5px; display:none; }
+    .admin-mode .delete-btn { display:block; }
+    label { display:block; margin-top:10px; }
+    input[type="text"], input[type="date"] { width:100%; padding:5px; }
+    #bug-report { position:fixed; right:20px; bottom:20px; background-color:#eee; border:1px solid #ccc; padding:5px 10px; font-size:12px; cursor:pointer; text-decoration:none; color:inherit;}
+    /* modal */
+    .modal-backdrop { position:fixed; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.5); display:flex; justify-content:center; align-items:center; z-index:1000; }
+    .modal { background:#fff; padding:16px; width:90%; max-width:900px; max-height:90%; overflow:auto; border-radius:8px; position:relative; }
+    .img-full { max-width:100%; height:auto; display:block; margin:0 auto; }
+    .close-x { position:absolute; right:8px; top:8px; background:#000; color:#fff; padding:6px 10px; border-radius:20px; cursor:pointer; }
+    #admin-timer { font-size:12px; color:#d00; margin-left:8px; display:inline-block; }
+    .meta { color:#666; font-size:13px; }
+    .chat-box { border-top:1px solid #eee; margin-top:10px; padding-top:10px; }
+    .chat-message { border:1px solid #ddd; padding:8px; margin-bottom:6px; border-radius:6px; position:relative; }
+    .small { font-size:13px; color:#555; }
+    .comment-delete { position:absolute; right:8px; top:8px; display:none; padding:2px 6px; font-size:12px; }
+    .admin-mode .comment-delete { display:inline-block; }
+  </style>
+</head>
+<body>
+
+<div id="top-bar">
+  <div id="left-menu">
+    <img src="https://guahm.sen.ms.kr/dggb/module/file/selectImageView.do?atchFileId=250498&fileSn=0" alt="로고" id="logo">
+    <button onclick="showPage('list')">분실품 보기</button>
+    <button onclick="showPage('register')">분실품 등록</button>
+    <button onclick="showPage('search')">내물건찾기</button>
+  </div>
+
+  <div id="admin-controls">
+    <button onclick="adjustFontSize(1)">글자 +</button>
+    <button onclick="adjustFontSize(-1)">글자 -</button>
+    <button id="admin-btn" onclick="enterAdmin()">관리자</button>
+    <span id="admin-timer" style="display:none"></span>
+  </div>
+</div>
+
+<!-- NOTE: CONFIG UI removed from visible UI per request.
+     The same 기능은 아래 CONFIG 객체로 코드 내부에 내장되어 있습니다.
+     실제 값은 아래 CONFIG 상수에서 직접 편집하세요.
+-->
+<!-- CONFIG (code internal) -->
+<script>
+/* ====== IMPORTANT: Edit these values directly here (or via console setConfig) ======
+   SECURITY WARNING: Putting PAT in client-side JS is insecure. For production, move to server.
+*/
+const CONFIG = {
+  owner: "ku11026",          // 예: "username 또는 org"
+  repo: "lostlist2",        // 예: "repo-name"
+  token: "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" // 개인 액세스 토큰(테스트 전용)
+};
+
+// helper to change config from console if needed:
+// setConfig({ owner:'me', repo:'r', token:'ghp_xxx' });
+function setConfig(obj) {
+  Object.assign(CONFIG, obj);
+  console.info('CONFIG updated', CONFIG);
+}
+</script>
+
+<div id="content">
+  <div id="list"><h2>분실물 목록</h2><div id="itemList"></div></div>
+
+  <div id="register">
+    <h2>분실물 등록</h2>
+    <label>제목 <input id="title" type="text"></label>
+    <label>내용(키워드) <input id="keyword" type="text"></label>
+    <label>사진 업로드 <input id="photoInput" type="file" accept="image/*"></label>
+    <label>글쓴이 <input id="author" type="text"></label>
+    <label>표시일 <input id="date" type="date"></label>
+    <br>
+    <button onclick="cancelRegister()">취소</button>
+    <button onclick="submitRegister()">등록</button>
+  </div>
+
+  <div id="search">
+    <h2>내 물건 찾기</h2>
+    <input id="searchInput" type="text" placeholder="검색어 입력 (스페이스로 구분된 여러 단어 모두 포함되는 항목만 표시됩니다)">
+    <button onclick="searchItems()">검색</button>
+    <div id="searchResult"></div>
+  </div>
+</div>
+
+<a id="bug-report" href="mailto:jaeubag801@gmail.com?subject=분실물 사이트 버그신고">버그,악성게시물 신고</a>
+
+<!-- 상세 모달 (동적 생성) -->
+<div id="modal-root"></div>
+
+<script>
+/* ===========================
+   getConfig: returns config object
+   Uses internal CONFIG by default. If visible inputs exist (legacy), will prefer them.
+   =========================== */
+function getConfig() {
+  // If the page still contains the old config inputs (for backward compatibility), prefer them when filled.
+  try {
+    const ownerEl = document.getElementById('config-owner');
+    const repoEl = document.getElementById('config-repo');
+    const tokenEl = document.getElementById('config-token');
+    if (ownerEl && repoEl && tokenEl) {
+      const owner = ownerEl.value.trim();
+      const repo = repoEl.value.trim();
+      const token = tokenEl.value.trim();
+      if (owner && repo && token) {
+        return { owner, repo, token };
+      }
+    }
+  } catch (e) { /* ignore */ }
+  // Otherwise use internal CONFIG
+  return { owner: CONFIG.owner || '', repo: CONFIG.repo || '', token: CONFIG.token || '' };
+}
+
+/* 유틸 */
+function apiFetch(path, method='GET', body=null, extraHeaders={}) {
+  const cfg = getConfig();
+  if (!cfg.owner || !cfg.repo || !cfg.token) {
+    return Promise.reject(new Error('GitHub 설정(owner/repo/token)을 입력하세요. (코드 내부 CONFIG 편집)'));
+  }
+  const url = 'https://api.github.com' + path;
+  const headers = Object.assign({
+    'Authorization': 'token ' + cfg.token,
+    'Accept': 'application/vnd.github.v3+json'
+  }, extraHeaders);
+  const opts = { method, headers };
+  if (body) opts.body = body;
+  return fetch(url, opts).then(async res => {
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error('GitHub API error: ' + res.status + ' ' + text);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  });
+}
+
+/* ===========================
+   파일 업로드: repo contents API 사용
+   - 경로: images/<timestamp>_<원래파일명>
+   - 요청: PUT /repos/:owner/:repo/contents/:path (content: base64)
+   =========================== */
+async function uploadImageFile(file) {
+  const cfg = getConfig();
+  const path = 'images/' + Date.now() + '_' + file.name.replace(/[^\w.\-]/g,'_');
+  const arrayBuffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  let binary = '';
+  for (let i=0;i<bytes.byteLength;i++) binary += String.fromCharCode(bytes[i]);
+  const base64 = btoa(binary);
+  const body = JSON.stringify({
+    message: 'upload image ' + path,
+    content: base64
+  });
+  const res = await apiFetch(`/repos/${cfg.owner}/${cfg.repo}/contents/${encodeURIComponent(path)}`, 'PUT', body, {'Content-Type':'application/json'});
+  // raw file url: use content.download_url if available, otherwise construct raw.githubusercontent url
+  if (res && res.content && res.content.download_url) return res.content.download_url;
+  return `https://raw.githubusercontent.com/${cfg.owner}/${cfg.repo}/main/${path}`;
+}
+
+/* ===========================
+   Issue 생성: 분실물 하나를 이슈로 만든다.
+   - 제목: item.title
+   - body: 마크다운 형태로 메타+사진 삽입
+   - label: 'lost-item'
+   =========================== */
+async function createLostIssue(item, imageUrl) {
+  const cfg = getConfig();
+  const bodyMd = [
+    `**내용(키워드):** ${item.keyword || ''}`,
+    `**작성자:** ${item.author || ''}`,
+    `**표시일:** ${item.date || ''}`,
+    '',
+    imageUrl ? `![photo](${imageUrl})` : '',
+    '',
+    `<!-- meta:lost-item -->`
+  ].join('\n\n');
+  const payload = JSON.stringify({
+    title: item.title || '(무제)',
+    body: bodyMd,
+    labels: ['lost-item']
+  });
+  return apiFetch(`/repos/${cfg.owner}/${cfg.repo}/issues`, 'POST', payload, {'Content-Type':'application/json'});
+}
+
+/* ===========================
+   이슈 목록 불러오기 (labels=lost-item)
+   =========================== */
+async function fetchLostIssues() {
+  const cfg = getConfig();
+  // open/closed 포함하여 모두 가져오려면 state=all
+  return apiFetch(`/repos/${cfg.owner}/${cfg.repo}/issues?labels=lost-item&state=all`);
+}
+
+/* ===========================
+   이슈(상세)와 채팅(코멘트) 가져오기
+   =========================== */
+async function fetchIssueComments(number) {
+  const cfg = getConfig();
+  return apiFetch(`/repos/${cfg.owner}/${cfg.repo}/issues/${number}/comments`);
+}
+
+/* 채팅(코멘트) 쓰기 */
+async function postIssueComment(number, text) {
+  const cfg = getConfig();
+  const payload = JSON.stringify({ body: text });
+  return apiFetch(`/repos/${cfg.owner}/${cfg.repo}/issues/${number}/comments`, 'POST', payload, {'Content-Type':'application/json'});
+}
+
+/* 코멘트 삭제 (관리자 전용) */
+async function deleteIssueComment(commentId) {
+  const cfg = getConfig();
+  // DELETE /repos/:owner/:repo/issues/comments/:comment_id
+  const url = `/repos/${cfg.owner}/${cfg.repo}/issues/comments/${commentId}`;
+  return apiFetch(url, 'DELETE');
+}
+
+/* 이슈 닫기(관리자) */
+async function closeIssue(number) {
+  const cfg = getConfig();
+  const payload = JSON.stringify({ state: 'closed' });
+  return apiFetch(`/repos/${cfg.owner}/${cfg.repo}/issues/${number}`, 'PATCH', payload, {'Content-Type':'application/json'});
+}
+
+/* 라벨 추가 (관리자 -> 'deleted') */
+async function addLabel(number, labels) {
+  const cfg = getConfig();
+  const payload = JSON.stringify({ labels });
+  return apiFetch(`/repos/${cfg.owner}/${cfg.repo}/issues/${number}/labels`, 'POST', payload, {'Content-Type':'application/json'});
+}
+
+/* ===========================
+   UI 로직
+   =========================== */
+let isAdmin = false;
+let adminCountdownInterval = null;
+
+function showPage(page) {
+  document.querySelectorAll('#content > div').forEach(div => div.style.display = 'none');
+  document.getElementById(page).style.display = 'block';
+  if (page === 'list') loadList();
+}
+
+function cancelRegister() {
+  ['title','keyword','photoInput','author','date'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el.type === 'file') el.value = '';
+    else el.value = '';
+  });
+  showPage('list');
+}
+
+/* ========== submitRegister - 절대 수정하지 않음 ========== */
+async function submitRegister() {
+  const fileEl = document.getElementById('photoInput');
+  const file = fileEl.files[0];
+  if (!file) return alert("사진을 선택해주세요.");
+  const item = {
+    title: document.getElementById('title').value || '(무제)',
+    keyword: document.getElementById('keyword').value || '',
+    author: document.getElementById('author').value || '',
+    date: document.getElementById('date').value || ''
+  };
+  try {
+    // 1) 이미지 업로드
+    const imgUrl = await uploadImageFile(file);
+    // 2) 이슈 생성
+    const issue = await createLostIssue(item, imgUrl);
+    alert('등록 완료! 이슈 #' + issue.number);
+    // 리셋
+    cancelRegister();
+  } catch (err) {
+    alert('등록 중 오류: ' + err.message);
+    console.error(err);
+  }
+}
+/* ===================================================== */
+
+/* 이슈 목록 불러와 카드 생성 */
+async function loadList() {
+  const container = document.getElementById('itemList');
+  container.innerHTML = '<p>로딩중...</p>';
+  try {
+    const issues = await fetchLostIssues();
+    if (!issues || issues.length === 0) {
+      container.innerHTML = '<p>등록된 분실물이 없습니다.</p>';
+      return;
+    }
+    container.innerHTML = '';
+    issues.forEach(issue => {
+      // 이슈 본문에서 첫 번째 이미지 URL을 추출 (markdown 이미지 문법 또는 raw.githubusercontent)
+      let imgUrl = null;
+      const body = issue.body || '';
+      const mdImgMatch = body.match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/);
+      if (mdImgMatch) imgUrl = mdImgMatch[1];
+      // 카드 생성
+      const div = document.createElement('div');
+      div.className = 'item' + (isAdmin ? ' admin-mode' : '');
+      div.onclick = (e) => {
+        // 클릭이 delete 버튼인 경우 무시
+        if (e.target.classList.contains('delete-btn')) return;
+        openDetailModal(issue, imgUrl);
+      };
+      const html = `
+        <div style="flex:1">
+          <strong>${escapeHtml(issue.title)}</strong><br>
+          <span class="meta">#${issue.number} · ${issue.state} · ${issue.user && issue.user.login ? escapeHtml(issue.user.login) : ''}</span>
+          <div class="small">${escapeHtml(extractMetaLine(body, '내용(키워드):'))}</div>
+        </div>
+      `;
+      div.innerHTML = html;
+      if (imgUrl) {
+        const img = document.createElement('img');
+        img.src = imgUrl;
+        img.alt = 'photo';
+        div.appendChild(img);
+      }
+      const delBtn = document.createElement('button');
+      delBtn.className = 'delete-btn';
+      delBtn.textContent = '삭제(관리자)';
+      delBtn.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!isAdmin) return alert('관리자만 삭제 가능합니다.');
+        if (!confirm('이 이슈를 닫고 삭제 표시(라벨 추가) 하시겠습니까?')) return;
+        try {
+          await closeIssue(issue.number);
+          await addLabel(issue.number, ['deleted']);
+          alert('삭제(닫기+라벨) 처리되었습니다.');
+          loadList();
+        } catch (err) {
+          alert('삭제 중 오류: ' + err.message);
+        }
+      };
+      div.appendChild(delBtn);
+      container.appendChild(div);
+    });
+  } catch (err) {
+    container.innerHTML = '<p>목록 불러오기 실패: ' + escapeHtml(err.message) + '</p>';
+  }
+}
+
+/* 검색 (개선됨)
+   - 여러 단어 스페이스 분리: 모든 단어(AND)를 포함하는 이슈만 반환
+   - 검색 대상: 제목, 본문(마크다운 포함), 작성자, 메타 키워드(본문에 있는 '내용(키워드):') 
+*/
+function searchItems() {
+  const raw = document.getElementById('searchInput').value.trim();
+  if (!raw) return alert('검색어를 입력하세요.');
+  const tokens = raw.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return alert('검색어를 입력하세요.');
+
+  fetchLostIssues().then(issues => {
+    const results = issues.filter(issue => {
+      const title = (issue.title || '').toLowerCase();
+      const body = (issue.body || '').toLowerCase();
+      const author = (issue.user && issue.user.login || '').toLowerCase();
+      const metaKeyword = extractMetaLine(issue.body || '', '내용(키워드):').toLowerCase();
+      // build searchable text segments
+      const segments = [title, body, author, metaKeyword].join(' ');
+      // require all tokens present (AND)
+      return tokens.every(t => segments.includes(t));
+    });
+
+    const div = document.getElementById('searchResult');
+    div.innerHTML = '';
+    if (results.length === 0) {
+      div.innerHTML = '<p>검색 결과가 없습니다.</p>';
+      return;
+    }
+    results.forEach(issue => {
+      const el = document.createElement('div');
+      el.className = 'item';
+      el.innerHTML = `<strong>${escapeHtml(issue.title)}</strong> (#${issue.number})<br><div class="small">${escapeHtml((issue.body||'').slice(0,200))}</div>`;
+      el.onclick = () => {
+        const mdImgMatch = (issue.body||'').match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/);
+        const imgUrl = mdImgMatch ? mdImgMatch[1] : null;
+        openDetailModal(issue, imgUrl);
+      };
+      div.appendChild(el);
+    });
+  }).catch(err => alert('검색 실패: ' + err.message));
+}
+
+/* 상세 모달 (상세+채팅) */
+function openDetailModal(issue, imgUrl) {
+  const root = document.getElementById('modal-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h3 style="margin:0">${escapeHtml(issue.title)} <span class="small">#${issue.number}</span></h3>
+      <button class="close-x" id="modal-close-x">X</button>
+    </div>
+    <div class="meta">작성자: ${escapeHtml(issue.user && issue.user.login || '')} · 상태: ${escapeHtml(issue.state)}</div>
+    <div style="margin-top:10px">${renderBodyAsHtml(issue.body || '')}</div>
+    <div style="margin-top:10px">
+      <strong>채팅</strong>
+      <div id="chatArea" class="chat-box"><p class="small">로딩중...</p></div>
+      <div style="margin-top:8px;">
+        <input id="chatInput" type="text" placeholder="메시지를 입력하세요" style="width:70%; padding:6px;">
+        <button id="chatSend">전송</button>
+        <button id="refreshComments">새로고침</button>
+      </div>
+    </div>
+  `;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+
+  // 닫기
+  document.getElementById('modal-close-x').onclick = () => root.innerHTML = '';
+
+  // 사진 전체화면 클릭 처리: body에 있는 img 태그에 클릭리스너 부착
+  const imgs = modal.querySelectorAll('img');
+  imgs.forEach(img => {
+    img.style.cursor = 'zoom-in';
+    img.onclick = (e) => {
+      openImageFullscreen(e.target.src);
+    };
+  });
+
+  const chatArea = modal.querySelector('#chatArea');
+
+  async function loadComments() {
+    chatArea.innerHTML = '<p class="small">로딩중...</p>';
+    try {
+      const comments = await fetchIssueComments(issue.number);
+      chatArea.innerHTML = '';
+      if (!comments || comments.length === 0) {
+        chatArea.innerHTML = '<p class="small">채팅이 없습니다.</p>';
+        return;
+      }
+      comments.forEach(c => {
+        const div = document.createElement('div');
+        div.className = 'chat-message' + (isAdmin ? ' admin-mode' : '');
+        // comment delete button (admin only)
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'comment-delete';
+        deleteBtn.textContent = '댓글삭제';
+        deleteBtn.onclick = async (ev) => {
+          ev.stopPropagation();
+          if (!isAdmin) return alert('관리자만 삭제 가능합니다.');
+          if (!confirm('이 댓글을 삭제하시겠습니까?')) return;
+          try {
+            await deleteIssueComment(c.id);
+            alert('댓글이 삭제되었습니다.');
+            loadComments();
+          } catch (err) {
+            alert('댓글 삭제 실패: ' + err.message);
+          }
+        };
+
+        div.innerHTML = `<div class="small"><strong>${escapeHtml(c.user && c.user.login || '')}</strong> · ${escapeHtml(new Date(c.created_at).toLocaleString())}</div>
+                         <div>${escapeHtml(c.body)}</div>`;
+        div.appendChild(deleteBtn);
+        chatArea.appendChild(div);
+      });
+    } catch (err) {
+      chatArea.innerHTML = '<p class="small">채팅 로드 실패: ' + escapeHtml(err.message) + '</p>';
+    }
+  }
+
+  // initial load
+  loadComments();
+
+  // refresh button
+  modal.querySelector('#refreshComments').onclick = loadComments;
+
+  // 채팅 전송
+  modal.querySelector('#chatSend').onclick = async () => {
+    const input = modal.querySelector('#chatInput');
+    const text = input.value.trim();
+    if (!text) return;
+    try {
+      await postIssueComment(issue.number, text);
+      // append instantly (optimistic)
+      const d = document.createElement('div');
+      d.className = 'chat-message';
+      d.innerHTML = `<div class="small"><strong>you</strong> · ${escapeHtml(new Date().toLocaleString())}</div><div>${escapeHtml(text)}</div>`;
+      chatArea.appendChild(d);
+      input.value = '';
+      // refresh to get real comment ids (so admin can delete if needed)
+      setTimeout(loadComments, 800);
+    } catch (err) {
+      alert('전송 실패: ' + err.message);
+    }
+  };
+}
+
+/* 사진 전체화면 모달 */
+function openImageFullscreen(src) {
+  const root = document.getElementById('modal-root');
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.style.background = 'transparent';
+  modal.style.border = 'none';
+  modal.style.maxWidth = 'none';
+  modal.style.maxHeight = 'none';
+  modal.style.padding = '0';
+  const closeBtn = document.createElement('div');
+  closeBtn.className = 'close-x';
+  closeBtn.textContent = 'X';
+  closeBtn.style.position = 'fixed';
+  closeBtn.style.right = '20px';
+  closeBtn.style.top = '20px';
+  closeBtn.onclick = () => root.innerHTML = '';
+  const img = document.createElement('img');
+  img.className = 'img-full';
+  img.src = src;
+  modal.appendChild(closeBtn);
+  modal.appendChild(img);
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+}
+
+/* 관리자 모드: 2분 타이머 */
+function enterAdmin() {
+  const pw = prompt('관리자 비밀번호를 입력하세요:');
+  // 여기에서 로컬 PW 비교 (초간단). 실제 서비스는 서버 인증 사용.
+  if (pw === '1234') {
+    isAdmin = true;
+    alert('관리자 모드 활성화되었습니다. 2분 후 자동 해제됩니다.');
+    document.getElementById('admin-timer').style.display = 'inline-block';
+    startAdminTimer(2 * 60); // 2분 (초)
+    loadList();
+  } else {
+    alert('비밀번호가 틀렸습니다.');
+  }
+}
+
+function startAdminTimer(seconds) {
+  clearAdminTimer();
+  let remaining = seconds;
+  const display = document.getElementById('admin-timer');
+  function tick() {
+    const mm = Math.floor(remaining / 60);
+    const ss = remaining % 60;
+    display.textContent = `관리자 모드: ${mm}:${String(ss).padStart(2,'0')} 남음`;
+    if (remaining <= 0) {
+      clearAdminTimer();
+      isAdmin = false;
+      display.style.display = 'none';
+      alert('관리자 모드가 종료되었습니다.');
+      loadList();
+    }
+    remaining--;
+  }
+  tick();
+  adminCountdownInterval = setInterval(tick, 1000);
+}
+
+function clearAdminTimer() {
+  if (adminCountdownInterval) { clearInterval(adminCountdownInterval); adminCountdownInterval = null; }
+}
+
+/* 폰트 크기 조절 */
+function adjustFontSize(delta) {
+  const body = document.body;
+  const currentSize = parseFloat(window.getComputedStyle(body).fontSize);
+  const newSize = currentSize + delta;
+  body.style.fontSize = newSize + 'px';
+}
+
+/* 보안 함수: HTML 이스케이프 */
+function escapeHtml(s) {
+  if (!s) return '';
+  return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+}
+
+/* body 마크다운 일부 렌더링(간단) - 이미지는 그대로 보여주기 */
+function renderBodyAsHtml(md) {
+  // 매우 간단한 변환: 이미지 마크다운 -> <img>, 줄바꿈 -> <br>
+  let html = md.replace(/!\[.*?\]\((https?:\/\/[^\)]+)\)/g, function(_, url){
+    return `<img src="${url}" style="max-width:100%; cursor:zoom-in">`;
+  });
+  html = html.replace(/\n/g, '<br>');
+  return html;
+}
+
+/* 본문에서 특정 메타 라인 추출 (very simple) */
+function extractMetaLine(body, key) {
+  const idx = (body||'').indexOf(key);
+  if (idx === -1) return '';
+  const rest = body.slice(idx+key.length);
+  const ln = rest.split('\n')[0];
+  return ln.trim();
+}
+
+/* 초기 페이지 */
+showPage('list');
+
+</script>
+</body>
+</html>
